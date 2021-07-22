@@ -6,12 +6,16 @@ library(sjlabelled)
 library(corpus)
 library(REDCapR) # Load the package into the current R session.
 
-plan(multisession)
+plan(multisession) # Data processing is intense. Spread computations over multiple cores
 
-data_refresh = F
+data_refresh = F # Dataset is large and only needs updating sometimes. Check T here to pull and process new data from RedCap
 
-data_dict <- read_csv("raw_data/EmergencyDepartmentFormsV2_DataDictionary_2021-07-14.csv") %>%
-  mutate(`Choices, Calculations, OR Slider Labels` =  map2(
+filter_to_first <- "migraine" # can set to "chronic_ha" to include other HA types
+
+# Load in data dictionary to add variable labels to RedCap data
+data_dict_loc <- "raw_data/EmergencyDepartmentFormsV2_DataDictionary_2021-07-14.csv"
+data_dict <- read_csv(data_dict_loc) %>% # Read in CSV
+  mutate(`Choices, Calculations, OR Slider Labels` =  map2( #If a checkbox, make sure to capture all checkbox variables
     `Choices, Calculations, OR Slider Labels`, 
     `Field Type`, ~unlist(ifelse(.y == "checkbox", str_split(.x, "(\\s+)?\\|(\\s+)?"), .x)))) %>%
   unnest(`Choices, Calculations, OR Slider Labels`) %>%
@@ -21,19 +25,19 @@ data_dict <- read_csv("raw_data/EmergencyDepartmentFormsV2_DataDictionary_2021-0
            `Variable / Field Name`
            ))
 
-headache_strings <- c("headache", "migraine", "head ache", 
-                      "head pain", "\\bha\\b")
-headache_regex <- regex(paste0("(", headache_strings, ")", 
+headache_strings <- c("headache", "migraine", "head ache", #A list of potential HA words in chief complaint
+                      "head pain", "\\bha\\b", "\\bh/a\\b") # Make sure to capture "ha" and "h/a" in note as well
+headache_regex <- regex(paste0("(", headache_strings, ")", # Create one long list of strings for regex search
                                collapse="|"), ignore_case = T)
 
-presents_strings <- c("presents(\\swith)?", "presented(\\swith)?", "presenting(\\swith)?",
-                      "present(\\swith)?", "pw", "p/w", "here with",
+presents_strings <- c("presents(\\swith)?", "presented(\\swith)?", "presenting(\\swith)?", # A list of potential words to signify a "presenting" complaint
+                      "present(\\swith)?", "pw", "p/w", "here with", # Be specific to capture different verb tenses + conjugations
                       "transferred", "transfers", "transfer", 
                       "refers", "referred", "refer", "sent", 
                       "admitted", "admits", "admit", "comes", 
                       "come", "coming", "setting of", 
                       "complaining", "complains", "complain")
-presents_regex <- regex(paste0("(", presents_strings, ")", 
+presents_regex <- regex(paste0("(", presents_strings, ")", # Create one long list of strings for regex search
                                collapse="|"), ignore_case = T)
 
 if (data_refresh){
@@ -89,14 +93,20 @@ if (data_refresh){
 
 data_ed_admission_ha_char <- data_ed_admission_ha_char %>%
   mutate(one_liner = str_sub(entire_note, end = 1000),
-         one_liner = str_remove(one_liner, regex("^.*(History of Present Illness\\:(\\s)+[·°º])")),
-         one_liner = str_remove(one_liner, regex("^.{0,30}Source\\:.{0,30}[·°º]")),
-         one_liner = str_remove(one_liner, regex("^.*CC.{0,5}\\:")),
-         one_liner = str_remove(one_liner, regex("\\?")),
-         one_liner = str_remove(one_liner, regex("(Time course.*$)|(Symptom onset.*$)")),
-         one_liner_sentences = map(one_liner, ~as.character(text_split(.x, units = "sentences")$text)),
+         one_liner = str_remove(
+           one_liner, regex("^.*(History of Present Illness\\:(\\s)+[·°º])")),
+         one_liner = str_remove(
+           one_liner, regex("^.{0,30}Source\\:.{0,30}[·°º]")),
+         one_liner = str_remove(
+           one_liner, regex("\\?")),
+         one_liner = str_remove(
+           one_liner, regex("(Time course.*$)|(Symptom onset.*$)")),
+         entire_note_sentences = map(
+           entire_note, ~unlist(str_split(
+             .x, regex("(?<!\\:)(\\s+)?[·°º]{2,}(\\s+)?", 
+                       ignore_case = TRUE)))),
          one_liner = str_trim(unlist(
-           map(one_liner, 
+           map(entire_note_sentences, 
                \(x){
                  y = unlist(as.character(text_split(x, units = "sentences")$text))
                  y = ifelse(is.na(y), "", y)
@@ -135,10 +145,75 @@ data_ed_admission_ha_char <- data_ed_admission_ha_char %>%
                         collapse="|"), ignore_case = T)))
 
 
-plan(sequential)
+j <- data_ed_admission_ha_char %>%
+  mutate(
+    entire_note = str_replace_all(
+      entire_note, c(
+        "\\:(\\s+)?[·°º]{2,}"= "\\: ",
+        "^.{0,60}(History of Present Illness\\:(\\s)+)" = "", 
+        "[^[:alnum:]]+\\?" = "",
+        "(?=\\([^\\)])\\?" = "",
+        "(?<!\\([^\\)])elevated troponin?" = "(elevated troponin)",
+        "Dr\\." = "Dr",
+        "Mr\\." = "Mr",
+        "Mrs\\." = "Mrs",
+        "Ms\\." = "Ms",
+        "\\.(?=.*is a)" = "",
+        "St\\." = "St",
+        "E\\.(\\s+)?coli" = "E coli")),
+    entire_note_sentences = map(
+      entire_note, ~unlist(str_split(
+        .x, regex("(?<!\\:)(\\s+)?[·°º]{2,}(\\s+)?", 
+                  ignore_case = TRUE)))),
+    one_liner = str_trim(
+      map_chr(entire_note_sentences, 
+          \(x){
+            
+            y = str_subset(
+              str_subset(x, regex("(CC\\:)|(\\bis a\\b)|(presents)", ignore_case = T)),
+              "Source", negate = TRUE)
+            
+            z = if (length(y) > 1) {
+              if (str_detect(y[[1]], 
+                             regex("(CC\\:)|(\\bis a\\b)", ignore_case = T)) &
+                  str_detect(y[[2]], 
+                             regex("(presents)", ignore_case = T))) {
+                str_c(y[1:2], collapse = " ")
+                
+              } else y[[1]]
+            } else if (length(y) == 1) {
+              
+              y[[1]]
+              
+            } else str_c(x[[1]], collapse = " ")
+            
+            return(z)})),
+    presents_with = 
+      map_chr(one_liner, 
+          \(x){
+            y = unlist(str_split(x, boundary("sentence")))
+            z = str_trim(
+              case_when(
+              any(str_detect(y, presents_regex)) ~ first(na.omit(str_extract(y, regex(
+                paste0("(", presents_strings, ".*$)", collapse="|"), 
+                ignore_case = T)))),
+              str_length(first(y)) < 25 ~ first(y),
+              str_detect(first(y), regex("\\bwith\\b|\\bw\\b|\\bw\\\b")) ~ str_remove(
+                first(y), regex("^.*(\\bwith\\b|\\bw\\b|\\bw\\\b)(?!.*\\b\\1\\b)"))))
+            
+            return(z)}),
+         ha_in_oneliner = str_detect(
+           presents_with, 
+           regex(paste0("(", headache_strings, ")", 
+                        collapse="|"), ignore_case = T)),
+         ha_in_cc = str_detect(
+           chief_comp, 
+           regex(paste0("(", headache_strings, ")", 
+                        collapse="|"), ignore_case = T)))
+
 
 ha_diagnoses_first <- ha_diagnoses %>%
-  filter(chronic_ha) %>%
+  filter(.data[[filter_to_first]]) %>% # Filter to first MIGRAINE diagnosis
   group_by(mrn) %>%
   mutate(across(migraine:other_ha, ~ifelse(.x, as.character(dxdt), NA))) %>%
   summarise(across(migraine:other_ha, ~{ymd(first(na.omit(.x)))}),
@@ -151,6 +226,15 @@ data_diagnosis <- data_diagnosis %>%
   mutate(past_cond = as.numeric(rowSums(across(starts_with("past"), 
     ~replace_na(.x, 0))) > 0))
 
+rowsum_columns <- \(x){
+  if (all(is.na(c_across(all_of(x))))){
+    y = NA_real_
+  } else {
+    y = as.numeric(sum(c_across(all_of(x)), na.rm = TRUE) > 0)
+  }
+  return(y)
+}
+
 
 data_ed_first_visits <- data_ed_admission_ha_char %>%
   filter(ha_in_oneliner) %>% 
@@ -159,64 +243,96 @@ data_ed_first_visits <- data_ed_admission_ha_char %>%
   left_join(data_demographics %>% 
               select(record_id, first_dx, sex, dob, race, ethnicity), 
             by = "record_id") %>%
-  filter(contact_date >= first_dx) %>%
+  filter(contact_date <= first_dx | is.na(first_dx)) %>%
   left_join(data_diagnosis %>% 
               select(record_id, csn_id_adm = csn_dx, past_cond),
             by = c("record_id", "csn_id_adm")) %>%
-  mutate(age = as.numeric(as.duration(interval(dob, contact_date)), "years"),
-         sex = factor(sex, levels = 1:2, labels = c("Female", "Male")),
-         race = factor(race, levels = c(1:8,99), labels = c(
-           "American Indian or Alaska Native", "Asian", "Black",
-           "Native Hawaiian or Other Pacific Islander", "White", 
-           "Multiracial", "Other", "Other", "Other")),
-         ethnicity = case_when(
-           ethnicity == 1 ~ 1,
-           ethnicity == 2 ~ 0,
-           TRUE ~ NA_real_),
-         dx_within_twelve = (
-           first_dx == contact_date | 
-             first_dx %within% interval(
-               contact_date, contact_date+years(1))),
-         nausea_vomit = as.numeric(rowSums(across(
-           c("assoc_sx___nausea", "assoc_sx___vomit", 
-             "gi_prob___vomit"), 
-           as.numeric), na.rm = T) > 0),
-         photo_phono = as.numeric(rowSums(across(
-           c("assoc_sx___photo", "assoc_sx___noise"), 
-           as.numeric), na.rm = T) > 0),
-         fever_total = as.numeric(rowSums(across(
-           c("fever", "overall_prob___fever"), 
-           as.numeric), na.rm = T) > 0 |
-             str_detect(fever_oth, "yes|chill")),
-         numb_sensory = as.numeric(rowSums(across(
-           c("assoc_sx___numb", "assoc_sx___sensory",
-             "neuro_prob___numb"), 
-           as.numeric), na.rm = T) > 0),
-         dizzy = as.numeric(
-           heart_prob___dizzy == 1 | 
-             str_detect(assoc_sx_oth, regex("(dizzy)|(dizziness)"))),
-         awaken = case_when(
-           awaken == 1 ~ 1,
-           awaken == 0 ~ 0,
-           str_detect(awaken_oth, regex("(yes)|(\\by\\b)", ignore_case = T)) ~ 1,
-           str_detect(awaken_oth, "but today HA") ~ 1,
-           str_detect(awaken_oth, regex("(\\bno\\b)|(never)|(\\bn\\b)", ignore_case = T)) ~ 0,
-           TRUE ~ NA_real_
-         ),
-         fundus_examined = as.numeric(!is.na(fundus)),
-         past_cond = ifelse(is.na(past_cond), 0, past_cond),
-         off_hours = as.numeric(!between(contact_time, hm("07:00"), hm("19:00"))))
+  mutate(age = as.numeric(as.duration(
+    interval(dob, contact_date)), "years"),
+    sex = factor(sex, levels = 1:2, labels = c("Female", "Male")),
+    race = factor(race, levels = c(1:8,99), labels = c(
+      "American Indian or Alaska Native", "Asian", "Black",
+      "Native Hawaiian or Other Pacific Islander", "White", 
+      "Multiracial", "Other", "Other", "Other")),
+    ethnicity = case_when(
+      ethnicity == 1 ~ 1,
+      ethnicity == 2 ~ 0,
+      TRUE ~ NA_real_),
+    dx_within_twelve = case_when(
+      first_dx == contact_date ~ 1, 
+        first_dx %within% interval(
+          contact_date, contact_date+years(1)) ~ 1,
+      TRUE ~ 0)) %>%
+  rowwise() %>%
+  mutate(
+    nausea_vomit = rowsum_columns(
+      c("assoc_sx___nausea", "assoc_sx___vomit", 
+        "gi_prob___vomit")),
+    photo_phono = rowsum_columns(
+      c("assoc_sx___photo", "assoc_sx___noise")),
+    fever_total = as.numeric(rowsum_columns(
+      c("fever", "overall_prob___fever")) == 1 |
+        str_detect(fever_oth, "yes|chill")),
+    numb_sensory = rowsum_columns(
+      c("assoc_sx___numb", "assoc_sx___sensory",
+        "neuro_prob___numb")),
+    dizzy = as.numeric(
+      heart_prob___dizzy == 1 | 
+        str_detect(assoc_sx_oth, 
+                   regex("(dizzy)|(dizziness)"))),
+    awaken = case_when(
+      awaken == 1 ~ 1,
+      awaken == 0 ~ 0,
+      str_detect(awaken_oth, 
+                 regex("(yes)|(\\by\\b)", 
+                       ignore_case = T)) ~ 1,
+      str_detect(awaken_oth, 
+                 "but today HA") ~ 1,
+      str_detect(awaken_oth, 
+                 regex("(\\bno\\b)|(never)|(\\bn\\b)", 
+                       ignore_case = T)) ~ 0,
+      TRUE ~ NA_real_
+    ),
+    fundus_examined = as.numeric(
+      !is.na(fundus) & 
+        !str_detect(fundus, 
+                    regex("(not tested)", 
+                          ignore_case = T)) &
+        !str_detect(fundus, 
+                    regex("(unable to examine)", 
+                          ignore_case = T)) &
+        !str_detect(fundus, 
+                    regex("null", ignore_case = T))),
+    past_cond = ifelse(is.na(past_cond), 
+                       0, past_cond),
+    off_hours = as.numeric(
+      !between(contact_time, 
+               hm("07:00"), hm("19:00")))) %>%
+  ungroup()
+
+plan(sequential)
 
 data_ed_first_visits %>%
+  mutate(dizzy_sentence = str_subset(
+    entire_note_sentences, regex("dizz", ignore_case = TRUE))) %>%
+    slice_sample(n = 5) %>%
+  pull(dizzy_sentence)
+
+           str_trim(unlist(
+    map(entire_note_sentences, 
+        \(x){
+          y = str_extract(x, regex("dizz", ignore_case = TRUE))
+          z = y
+          return(z)})))) %>%
   select(dx_within_twelve, age, sex, race, ethnicity, past_cond,
-         seiz_hist = hist_ed___sz, off_hours, 
          occipital = location___occ, 
          awaken, fever_total, nausea_vomit, photo_phono, 
+         photophobia = assoc_sx___photo, phonophobia = assoc_sx___noise,
          vision_changes = assoc_sx___vision, dizzy,
          worsen_activity = assoc_sx___active,
          altered_mental = neuro_prob___alt_mental,
-         fundus_examined) %>%
+         fundus_examined, dizzy_sentence) %>%
   summarise(across(everything(), ~scales::percent(
-    sum(is.na(.x))/n(), accuracy = 0.0001)))
+    sum(is.na(.x))/n(), accuracy = 0.0001))) %>% View()
 
 

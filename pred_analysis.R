@@ -5,6 +5,9 @@ library(future)
 library(sjlabelled)
 library(corpus)
 library(REDCapR) # Load the package into the current R session.
+library(caret)
+library(glmnet)
+library(ROCR)
 
 plan(multisession) # Data processing is intense. Spread computations over multiple cores
 
@@ -91,61 +94,7 @@ if (data_refresh){
 
 
 
-data_ed_admission_ha_char <- data_ed_admission_ha_char %>%
-  mutate(one_liner = str_sub(entire_note, end = 1000),
-         one_liner = str_remove(
-           one_liner, regex("^.*(History of Present Illness\\:(\\s)+[·°º])")),
-         one_liner = str_remove(
-           one_liner, regex("^.{0,30}Source\\:.{0,30}[·°º]")),
-         one_liner = str_remove(
-           one_liner, regex("\\?")),
-         one_liner = str_remove(
-           one_liner, regex("(Time course.*$)|(Symptom onset.*$)")),
-         entire_note_sentences = map(
-           entire_note, ~unlist(str_split(
-             .x, regex("(?<!\\:)(\\s+)?[·°º]{2,}(\\s+)?", 
-                       ignore_case = TRUE)))),
-         one_liner = str_trim(unlist(
-           map(entire_note_sentences, 
-               \(x){
-                 y = unlist(as.character(text_split(x, units = "sentences")$text))
-                 y = ifelse(is.na(y), "", y)
-                 y_starts = if (any(str_detect(y, regex("^(\\s)+(is a\\b)")))) {
-                   first(str_which(y, "\\bis a\\b")) - 1
-                 }else if (any(str_detect(y, "\\bis a\\b"))) {
-                   first(str_which(y, "\\bis a\\b"))
-                 } else 1
-                 
-                 y_presents = if (any(str_detect(y, presents_regex))){
-                   first(str_which(y, presents_regex))
-                 }else y_starts+1
-                 
-                 z = ifelse(
-                   str_length(y[y_starts]) > 15 | 
-                     is.na(y[2]) | 
-                     str_detect(y[y_starts], "\\?") | 
-                     !str_detect(y[y_starts], presents_regex), 
-                   y[y_starts], paste(y[y_starts:y_presents]))
-                 return(z)}))),
-         one_liner = ifelse(str_length(one_liner) > 15, one_liner, hist_ed_oth),
-         one_liner = str_remove_all(one_liner, regex("[·°º]|(^CC(\\:)?)|(HPI(\\:)?$)")),
-         presents_with = str_trim(case_when(
-           str_detect(one_liner, presents_regex) ~ str_remove(one_liner, regex(
-             paste0("^.*(", presents_strings, ")", collapse="|"), ignore_case = T)),
-           str_length(one_liner) < 25 ~ one_liner,
-           str_detect(one_liner, regex("\\bwith\\b|\\bw\\b|\\bw\\\b")) ~ str_remove(
-             one_liner, regex("^.*(\\bwith\\b|\\bw\\b|\\bw\\\b)(?!.*\\b\\1\\b)")))),
-         ha_in_oneliner = str_detect(
-           presents_with, 
-           regex(paste0("(", headache_strings, ")", 
-                        collapse="|"), ignore_case = T)),
-         ha_in_cc = str_detect(
-           chief_comp, 
-           regex(paste0("(", headache_strings, ")", 
-                        collapse="|"), ignore_case = T)))
-
-
-j <- data_ed_admission_ha_char %>%
+data_ed_admission_ha_char <-  data_ed_admission_ha_char %>%
   mutate(
     entire_note = str_replace_all(
       entire_note, c(
@@ -243,7 +192,13 @@ data_ed_first_visits <- data_ed_admission_ha_char %>%
   left_join(data_demographics %>% 
               select(record_id, first_dx, sex, dob, race, ethnicity), 
             by = "record_id") %>%
-  filter(contact_date <= first_dx | is.na(first_dx)) %>%
+  mutate(dx_before = case_when(
+    contact_date >= first_dx ~ 1,
+    contact_date <= first_dx ~ 0,
+    is.na(first_dx) ~ 0
+  )) %>%
+  filter(dx_before == 0) %>%
+  select(-dx_before) %>%
   left_join(data_diagnosis %>% 
               select(record_id, csn_id_adm = csn_dx, past_cond),
             by = c("record_id", "csn_id_adm")) %>%
@@ -262,7 +217,24 @@ data_ed_first_visits <- data_ed_admission_ha_char %>%
       first_dx == contact_date ~ 1, 
         first_dx %within% interval(
           contact_date, contact_date+years(1)) ~ 1,
-      TRUE ~ 0)) %>%
+      TRUE ~ 0),
+    woke_from = map_dbl(entire_note_sentences, \(x){
+      
+      y =  str_subset(
+        unlist(str_split(x, boundary("sentence"))),
+        regex("((\\bwake)|(\\bwaking)|(\\bwoke)|(\\bawake)|(\\bawoke)).{0,40}((from sleep)|((complain|(due to)|from).{0,10}(head|ha\\b|h/a\\b|migraine|pain)))", 
+              ignore_case = TRUE))
+      
+      z = case_when(
+        any(str_detect(y, regex("((denie)|(deny)|(not)|(didnt)|(didn\\'t)).{0,20}((\\bwake)|(\\bwaking)|(\\bwoke)|(\\bawake)|(\\bawoke)).{0,40}((from sleep)|((complain|(due to)|from).{0,10}(head|ha\\b|h/a\\b|migraine|pain)))",
+                                ignore_case = TRUE))) ~ 0,
+        any(str_detect(y, regex("((\\bwake)|(\\bwaking)|(\\bwoke)|(\\bawake)|(\\bawoke)).{0,40}((from sleep)|((complain|(due to)|from).{0,10}(head|ha\\b|h/a\\b|migraine|pain)))",
+                                ignore_case = TRUE))) ~ 1,
+        TRUE ~ NA_real_
+      )
+      
+      return(z)
+    })) %>%
   rowwise() %>%
   mutate(
     nausea_vomit = rowsum_columns(
@@ -270,16 +242,22 @@ data_ed_first_visits <- data_ed_admission_ha_char %>%
         "gi_prob___vomit")),
     photo_phono = rowsum_columns(
       c("assoc_sx___photo", "assoc_sx___noise")),
-    fever_total = as.numeric(rowsum_columns(
-      c("fever", "overall_prob___fever")) == 1 |
-        str_detect(fever_oth, "yes|chill")),
+    fever_total = case_when(
+      rowsum_columns(
+        c("fever", "overall_prob___fever")) == 1 ~ 1,
+      str_detect(fever_oth, "yes|chill") ~ 1,
+      is.na(fever_oth) & is.na(fever) & is.na(overall_prob___fever) ~ NA_real_,
+      TRUE ~ 0),
     numb_sensory = rowsum_columns(
       c("assoc_sx___numb", "assoc_sx___sensory",
         "neuro_prob___numb")),
-    dizzy = as.numeric(
-      heart_prob___dizzy == 1 | 
+    dizzy = case_when(
+      heart_prob___dizzy == 1 ~ 1, 
         str_detect(assoc_sx_oth, 
-                   regex("(dizzy)|(dizziness)"))),
+                   regex("(dizzy)|(dizziness)")) ~ 1,
+      is.na(heart_prob___dizzy) & is.na(assoc_sx_oth) ~ NA_real_,
+      TRUE ~ 0
+        ),
     awaken = case_when(
       awaken == 1 ~ 1,
       awaken == 0 ~ 0,
@@ -291,18 +269,10 @@ data_ed_first_visits <- data_ed_admission_ha_char %>%
       str_detect(awaken_oth, 
                  regex("(\\bno\\b)|(never)|(\\bn\\b)", 
                        ignore_case = T)) ~ 0,
+      woke_from == 1 ~ 1,
+      woke_from == 0 ~ 0,
       TRUE ~ NA_real_
     ),
-    fundus_examined = as.numeric(
-      !is.na(fundus) & 
-        !str_detect(fundus, 
-                    regex("(not tested)", 
-                          ignore_case = T)) &
-        !str_detect(fundus, 
-                    regex("(unable to examine)", 
-                          ignore_case = T)) &
-        !str_detect(fundus, 
-                    regex("null", ignore_case = T))),
     past_cond = ifelse(is.na(past_cond), 
                        0, past_cond),
     off_hours = as.numeric(
@@ -312,27 +282,217 @@ data_ed_first_visits <- data_ed_admission_ha_char %>%
 
 plan(sequential)
 
-data_ed_first_visits %>%
-  mutate(dizzy_sentence = str_subset(
-    entire_note_sentences, regex("dizz", ignore_case = TRUE))) %>%
-    slice_sample(n = 5) %>%
-  pull(dizzy_sentence)
 
-           str_trim(unlist(
-    map(entire_note_sentences, 
-        \(x){
-          y = str_extract(x, regex("dizz", ignore_case = TRUE))
-          z = y
-          return(z)})))) %>%
-  select(dx_within_twelve, age, sex, race, ethnicity, past_cond,
+data_ed_first_visits %>%
+  mutate(fam_hx_ha = case_when(
+    str_detect(fam_hx_oth, regex("(\\bno|\\bneg)[^\\.]{0,30}(heada*|(head ache)|migra*|\\bha\\b|h/a)", ignore_case = TRUE))  ~ 0,
+    str_detect(fam_hx_oth, regex("(heada*|(head ache)|migra*|\\bha\\b|h/a)", ignore_case = TRUE))  ~ 1,
+    str_detect(fam_hx_oth, regex("(fam|mother|father|mom|dad|\\bbro|\\bsis|aunt|uncle|grandma|grandpa).{0,20}(has|had|have|get).{0,20}(heada*|(head ache)|migra*|\\bha\\b|h/a)", ignore_case = T)) ~ 1,
+    str_detect(fam_hx_oth, regex("Family History: Reviewed and non-contributory", ignore_case = TRUE)) ~ 0,
+    TRUE ~ NA_real_)) %>% select(record_id, entire_note, fam_hx_oth, fam_hx_ha) %>% View()
+       
+
+
+  fam_hx_sentence = map_chr(
+    entire_note_sentences, ~str_c(.x[str_detect(.x, regex("(?=.*(fam|mother|father|mom|dad|\\bbro|\\bsis|aunt|uncle|grandma|grandpa|\\bfmhx).*)(?=.*(hist|hx).*)(?=.*(heada*|(head ache)|migra*|\\bha\\b|h/a).*).*",
+                                ignore_case = TRUE)) |
+              str_detect(.x,regex("((fam|mother|father|mom|dad|\\bbro|\\bsis|aunt|uncle|grandma|grandpa).{0,20}(has|had|have|get).{0,20}(heada*|(head ache)|migra*|\\bha\\b|h/a))",
+                                 ignore_case = TRUE))], collapse = "; ")
+
+  )) %>%
+  filter(nchar(fam_hx_sentence) > 0) %>%
+  mutate(
+    fam_hx_ha = case_when(
+      str_detect(fam_hx_oth, regex("(\\bno|\\bneg).{0,30}(heada*|(head ache)|migra*|\\bha\\b|h/a)", ignore_case = TRUE))  ~ 0,
+      str_detect(fam_hx_sentence, regex("(\\bno|\\bneg).{0,30}(heada*|(head ache)|migra*|\\bha\\b|h/a)", ignore_case = TRUE))  ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  select(fam_hx_sentence, fam_hx_oth, fam_hx_ha) %>% View()
+  
+  case_when(
+    any(str_detect(unlist(str_split(fam_hx_oth, boundary("sentence"))), regex("^.{0,10}(\\bno|\\bneg|\\-).{0,30}(heada*|(head ache)|migra*|\\bha\\b|h/a)", ignore_case = TRUE)))  ~ 0,
+    any(str_detect(unlist(str_split(fam_hx_sentence, boundary("sentence"))), regex("^.{0,10}(\\bno|\\bneg|\\-).{0,30}(heada*|(head ache)|migra*|\\bha\\b|h/a)", ignore_case = TRUE)))  ~ 0
+    )) %>%
+  select(record_id, entire_note, fam_hx_oth, fam_hx_sentence, fam_hx_ha) %>%
+  View()
+  mutate(fam_hx_mi = map_lgl(fam_hx_sentence, \(x){
+    y = unlist(str_split(x, boundary("sentence")))
+    z = any(str_detect(y, regex("(?=.*(fam|mother|father|mom|dad|\\bbro|\\bsis|aunt|uncle|grandma|grandpa|\\bfmhx).*)(?=.*(hist|hx).*)(?=.*(heada*|migra*|\\bha\\b|h/a).*).*",
+                             ignore_case = TRUE)) |
+              str_detect(y,regex("(fam|mother|father|mom|dad|\\bbro|\\bsis|aunt|uncle|grandma|grandpa).{0,20}(has|had|have|get).{0,20}(heada*|migra*|\\bha\\b|h/a)",
+                    ignore_case = TRUE)))
+  })) %>%
+  View()
+
+mutate(fam_hx_sentence = map_chr(entire_note_sentences, ~str_c(
+  .x[str_detect(.x, regex("\\b(fam|mother|father|mom|dad)", ignore_case = T)) & 
+       str_detect(.x, regex("\\b(hist|hx)", ignore_case = T)) &
+       !str_detect(.x, regex("social history", ignore_case = T))], collapse = "; "))) %>%
+  
+  
+  mutate(fam_hx_mi = map_dbl(entire_note_sentences, \(x){
+    
+    y =  str_subset(
+      unlist(str_split(x, boundary("sentence"))),
+      regex("(?=.*\bfam.{0,15}hist.*)(?=.*(head*|migra*|\\bha\\b|h/a)).*", 
+            ignore_case = TRUE))
+    
+    z = case_when(
+      any(str_detect(y, regex("((denie)|(deny)|(not)|(didnt)|(didn\\'t)).{0,20}((\\bwake)|(\\bwaking)|(\\bwoke)|(\\bawake)|(\\bawoke)).{0,40}((from sleep)|((complain|(due to)|from).{0,10}(head|ha\\b|h/a\\b|migraine|pain)))",
+                              ignore_case = TRUE))) ~ 0,
+      any(str_detect(y, regex("((\\bwake)|(\\bwaking)|(\\bwoke)|(\\bawake)|(\\bawoke)).{0,40}((from sleep)|((complain|(due to)|from).{0,10}(head|ha\\b|h/a\\b|migraine|pain)))",
+                          ignore_case = TRUE))) ~ 1,
+      TRUE ~ NA_real_
+    )
+    
+    return(z)
+  })) %>%
+  select(record_id, awake_sentence, woke_from) %>% View()
+
+
+data_ed_first_visits_complete <- data_ed_first_visits %>%
+  filter(between(age, 3, 17)) %>%
+  mutate(train = as.numeric(contact_date < as.Date("2019-01-01")),
+         age = scale(age),
+         severity_oth = ifelse(severity %in% c(999, 9999) & severity_oth == 'Pain severity: "',
+                               map_chr(entire_note_sentences, ~str_c(
+                                 str_subset(.x, regex("pain severity", ignore_case = T)), collapse = "; ")),
+                               severity_oth),
+         side = relevel(fct_collapse(side, `bilateral` = c("bi"),
+                                     `unilateral` = c("right", "left", "uni_l_r"),
+                                     `other` = c("oth")), ref = "unilateral"),
+         severity_new = case_when(
+           severity %in% 7:10 ~ 1,
+           severity %in% 0:6 ~ 0,
+           severity %in% c(999, 9999) & str_detect(entire_note, regex("(7|8|9|(10))(\\s+)?(\\/|(out)? of)(\\s+)?10", ignore_case = T)) ~ 1,
+           severity %in% c(999, 9999) & str_detect(severity_oth, regex("((?<!(most|more).{0,10})severe)|devere|excruciating|\\b(7|8|9|(?<![0-9/].{0,3})10)\\b(?!.{0,10}(hour|\\bmins|minute|day))|(very bad)", ignore_case = T)) ~ 1,
+           severity %in% c(999, 9999) & str_detect(severity_oth, regex("mild|moderate", ignore_case = T)) ~ 0,
+           severity %in% c(999, 9999) & str_detect(entire_note, regex("([0-6](\\s+)?(\\/|(out)? of)(\\s+)?10)|(\\b[0-6]\\b(?!.{0,10}(hour|\\bmins|minute|day)))", ignore_case = T)) ~ 0
+           ))  %>%
+  select(record_id, dx_within_twelve, train, contact_date, age, sex, past_cond,
          occipital = location___occ, 
-         awaken, fever_total, nausea_vomit, photo_phono, 
+         fever_total, nausea_vomit, 
          photophobia = assoc_sx___photo, phonophobia = assoc_sx___noise,
          vision_changes = assoc_sx___vision, dizzy,
          worsen_activity = assoc_sx___active,
          altered_mental = neuro_prob___alt_mental,
-         fundus_examined, dizzy_sentence) %>%
-  summarise(across(everything(), ~scales::percent(
-    sum(is.na(.x))/n(), accuracy = 0.0001))) %>% View()
+         side, severity_new) %>%
+  filter(complete.cases(.)) %>%
+  filter(contact_date < as.Date("2020-03-01")) 
 
+p1 <- data_ed_first_visits_complete %>%
+  mutate(year = year(contact_date)) %>%
+ggplot(data = ., aes(year, fill = factor(train))) +
+  geom_bar(stat = "count") +
+  labs(x = "Year", y = "Count") +
+  ggthemes::scale_fill_ptol() +
+  ggthemes::theme_tufte(base_size = 20, base_family = "sans") +
+  theme(legend.position = "none")
+
+data_ed_first_visits_train <- data_ed_first_visits_complete %>%
+  filter(train == 1) %>%
+  select(-record_id, -train, -contact_date) %>%
+  slice_sample(n = nrow(.), replace = TRUE)
+
+data_ed_first_visits_test <- data_ed_first_visits_complete %>%
+  filter(train == 0) %>%
+  select(-record_id, -train, -contact_date)
+
+
+set.seed(42)
+cv_10 = trainControl(method = "cv", number = 10)
+
+ed_elnet = train(
+  factor(dx_within_twelve) ~ ., 
+  data = data_ed_first_visits_train,
+  method = "glmnet",
+  trControl = cv_10,
+  tuneLength = 10
+)
+
+get_best_result = function(caret_fit) {
+  best = which(rownames(caret_fit$results) == rownames(caret_fit$bestTune))
+  best_result = caret_fit$results[best, ]
+  rownames(best_result) = NULL
+  best_result
+}
+
+
+encoder <- onehot::onehot(data_ed_first_visits_train)
+data_ed_first_visits_train_encode <- predict(encoder, data_ed_first_visits_train)
+data_ed_first_visits_test_encode <- predict(encoder, data_ed_first_visits_test)
+
+ed_elnet2 <- cv.glmnet(x = data_ed_first_visits_train_encode[,-1],
+          y = data_ed_first_visits_train_encode[,1],
+          family = "binomial",
+          nfolds = 10,
+          relax = TRUE,
+          gamma = seq(0,1,0.1))
+
+plot(ed_elnet2, label = T, xvar = 'lambda')
+
+
+elnet_train_preds <- as.vector(
+  predict(ed_elnet2,
+          type = "response", s = "lambda.1se", gamma = "gamma.1se",
+          as.matrix(data_ed_first_visits_train_encode[,-1])
+  ))
+
+coef(ed_elnet2, s = "lambda.1se", gamma = "gamma.1se",)
+  
+elnet_test_preds <- as.vector(
+  predict(ed_elnet2,
+          type = "response", s = "lambda.1se",  gamma = "gamma.1se",
+          as.matrix(data_ed_first_visits_test_encode[,-1])
+  ))
+
+elnet_prediction <- prediction(elnet_test_preds,
+                               data_ed_first_visits_test_encode[,1])
+
+plot(performance(elnet_prediction, 'tpr', 'fpr'), col = 'green')
+lines(c(0,1),c(0,1),col = "gray", lty = 4 )
+
+performance(elnet_prediction, 'auc')@y.values[[1]]
+
+tibble(y =  factor(data_ed_first_visits_test_encode[,1]),
+         mod = elnet_test_preds) %>%
+  calibration(y ~ mod, data = ., cuts = 10) %>%
+  ggplot(.) + 
+  ggthemes::theme_tufte(base_size = 20, base_family = "sans")
+
+pROC::auc(factor(data_ed_first_visits_test_encode[,1]), 
+          elnet_test_preds)
+pROC::ci.auc(factor(data_ed_first_visits_test_encode[,1]), 
+             elnet_test_preds, conf.level = 0.95,
+             boot.stratified = T,
+             method = "bootstrap") 
+
+x <- seq(0.05,0.95, 0.05) %>%
+  map_df(., \(x){
+    threshold = x
+    
+    y = tibble(threshold = threshold,
+               obs =  data_ed_first_visits_test_encode[,1],
+           pred_prob = elnet_test_preds,
+           pred_resp = as.numeric(pred_prob >= threshold),
+           correct = as.numeric(obs == pred_resp))
+    
+    ppv = y %>%
+      group_by(threshold, pred_resp) %>%
+      summarise(prop_correct = mean(correct)) %>%
+      mutate(pred_resp = factor(pred_resp, 
+                                levels = c(0,1),
+                                labels = c("NPV", "PPV"))) %>%
+      pivot_wider(names_from = pred_resp, values_from = prop_correct) 
+
+    
+    return(ppv)
+  })
+
+confusionMatrix(
+  data = as.factor(elnet_test_preds >= 0.2), 
+  reference = factor(data_ed_first_visits_test_encode[,1] == 1),
+  positive = "TRUE"
+  )
 

@@ -1,10 +1,11 @@
 
+
 library(tidyverse)
 library(lubridate)
 library(future)
 library(sjlabelled)
 library(corpus)
-library(REDCapR) # Load the package into the current R session.
+library(REDCapR)
 library(caret)
 library(glmnet)
 library(ROCR)
@@ -283,83 +284,18 @@ data_ed_first_visits <- data_ed_admission_ha_char %>%
 plan(sequential)
 
 
-data_ed_first_visits %>%
-  mutate(fam_hx_ha = case_when(
-    str_detect(fam_hx_oth, regex("(\\bno|\\bneg)[^\\.]{0,30}(heada*|(head ache)|migra*|\\bha\\b|h/a)", ignore_case = TRUE))  ~ 0,
-    str_detect(fam_hx_oth, regex("(heada*|(head ache)|migra*|\\bha\\b|h/a)", ignore_case = TRUE))  ~ 1,
-    str_detect(fam_hx_oth, regex("(fam|mother|father|mom|dad|\\bbro|\\bsis|aunt|uncle|grandma|grandpa).{0,20}(has|had|have|get).{0,20}(heada*|(head ache)|migra*|\\bha\\b|h/a)", ignore_case = T)) ~ 1,
-    str_detect(fam_hx_oth, regex("Family History: Reviewed and non-contributory", ignore_case = TRUE)) ~ 0,
-    TRUE ~ NA_real_)) %>% select(record_id, entire_note, fam_hx_oth, fam_hx_ha) %>% View()
-       
-
-
-  fam_hx_sentence = map_chr(
-    entire_note_sentences, ~str_c(.x[str_detect(.x, regex("(?=.*(fam|mother|father|mom|dad|\\bbro|\\bsis|aunt|uncle|grandma|grandpa|\\bfmhx).*)(?=.*(hist|hx).*)(?=.*(heada*|(head ache)|migra*|\\bha\\b|h/a).*).*",
-                                ignore_case = TRUE)) |
-              str_detect(.x,regex("((fam|mother|father|mom|dad|\\bbro|\\bsis|aunt|uncle|grandma|grandpa).{0,20}(has|had|have|get).{0,20}(heada*|(head ache)|migra*|\\bha\\b|h/a))",
-                                 ignore_case = TRUE))], collapse = "; ")
-
-  )) %>%
-  filter(nchar(fam_hx_sentence) > 0) %>%
-  mutate(
-    fam_hx_ha = case_when(
-      str_detect(fam_hx_oth, regex("(\\bno|\\bneg).{0,30}(heada*|(head ache)|migra*|\\bha\\b|h/a)", ignore_case = TRUE))  ~ 0,
-      str_detect(fam_hx_sentence, regex("(\\bno|\\bneg).{0,30}(heada*|(head ache)|migra*|\\bha\\b|h/a)", ignore_case = TRUE))  ~ 0,
-      TRUE ~ NA_real_
-    )
-  ) %>%
-  select(fam_hx_sentence, fam_hx_oth, fam_hx_ha) %>% View()
-  
-  case_when(
-    any(str_detect(unlist(str_split(fam_hx_oth, boundary("sentence"))), regex("^.{0,10}(\\bno|\\bneg|\\-).{0,30}(heada*|(head ache)|migra*|\\bha\\b|h/a)", ignore_case = TRUE)))  ~ 0,
-    any(str_detect(unlist(str_split(fam_hx_sentence, boundary("sentence"))), regex("^.{0,10}(\\bno|\\bneg|\\-).{0,30}(heada*|(head ache)|migra*|\\bha\\b|h/a)", ignore_case = TRUE)))  ~ 0
-    )) %>%
-  select(record_id, entire_note, fam_hx_oth, fam_hx_sentence, fam_hx_ha) %>%
-  View()
-  mutate(fam_hx_mi = map_lgl(fam_hx_sentence, \(x){
-    y = unlist(str_split(x, boundary("sentence")))
-    z = any(str_detect(y, regex("(?=.*(fam|mother|father|mom|dad|\\bbro|\\bsis|aunt|uncle|grandma|grandpa|\\bfmhx).*)(?=.*(hist|hx).*)(?=.*(heada*|migra*|\\bha\\b|h/a).*).*",
-                             ignore_case = TRUE)) |
-              str_detect(y,regex("(fam|mother|father|mom|dad|\\bbro|\\bsis|aunt|uncle|grandma|grandpa).{0,20}(has|had|have|get).{0,20}(heada*|migra*|\\bha\\b|h/a)",
-                    ignore_case = TRUE)))
-  })) %>%
-  View()
-
-mutate(fam_hx_sentence = map_chr(entire_note_sentences, ~str_c(
-  .x[str_detect(.x, regex("\\b(fam|mother|father|mom|dad)", ignore_case = T)) & 
-       str_detect(.x, regex("\\b(hist|hx)", ignore_case = T)) &
-       !str_detect(.x, regex("social history", ignore_case = T))], collapse = "; "))) %>%
-  
-  
-  mutate(fam_hx_mi = map_dbl(entire_note_sentences, \(x){
-    
-    y =  str_subset(
-      unlist(str_split(x, boundary("sentence"))),
-      regex("(?=.*\bfam.{0,15}hist.*)(?=.*(head*|migra*|\\bha\\b|h/a)).*", 
-            ignore_case = TRUE))
-    
-    z = case_when(
-      any(str_detect(y, regex("((denie)|(deny)|(not)|(didnt)|(didn\\'t)).{0,20}((\\bwake)|(\\bwaking)|(\\bwoke)|(\\bawake)|(\\bawoke)).{0,40}((from sleep)|((complain|(due to)|from).{0,10}(head|ha\\b|h/a\\b|migraine|pain)))",
-                              ignore_case = TRUE))) ~ 0,
-      any(str_detect(y, regex("((\\bwake)|(\\bwaking)|(\\bwoke)|(\\bawake)|(\\bawoke)).{0,40}((from sleep)|((complain|(due to)|from).{0,10}(head|ha\\b|h/a\\b|migraine|pain)))",
-                          ignore_case = TRUE))) ~ 1,
-      TRUE ~ NA_real_
-    )
-    
-    return(z)
-  })) %>%
-  select(record_id, awake_sentence, woke_from) %>% View()
-
 
 data_ed_first_visits_complete <- data_ed_first_visits %>%
   filter(between(age, 3, 17)) %>%
   mutate(train = as.numeric(contact_date < as.Date("2019-01-01")),
          age = scale(age),
-         severity_oth = ifelse(severity %in% c(999, 9999) & severity_oth == 'Pain severity: "',
+         severity_oth = ifelse(
+           severity %in% c(999, 9999) & severity_oth == 'Pain severity: "',
                                map_chr(entire_note_sentences, ~str_c(
                                  str_subset(.x, regex("pain severity", ignore_case = T)), collapse = "; ")),
                                severity_oth),
-         side = relevel(fct_collapse(side, `bilateral` = c("bi"),
+         side = relevel(fct_collapse(
+           side, `bilateral` = c("bi"),
                                      `unilateral` = c("right", "left", "uni_l_r"),
                                      `other` = c("oth")), ref = "unilateral"),
          severity_new = case_when(
@@ -495,4 +431,57 @@ confusionMatrix(
   reference = factor(data_ed_first_visits_test_encode[,1] == 1),
   positive = "TRUE"
   )
+
+test_demographics <- data_ed_first_visits_complete %>%
+  filter(train == 0) %>%
+  left_join(data_ed_first_visits %>% 
+              select(record_id, race, ethnicity),
+            by = "record_id") %>%
+  mutate(
+    pred_probs = elnet_test_preds,
+    ethnicity = factor(
+      ethnicity, levels = 0:1, 
+      labels = c("Non-Hispanic/Latinx", "Hispanic/Latinx")),
+    race = fct_lump_n(race, n = 3)) %>%
+  select(record_id, dx_within_twelve, sex, race, 
+         ethnicity, pred_probs) 
+
+test_demographics %>%
+  pivot_longer(cols = c(dx_within_twelve, pred_probs)) %>%
+  mutate(name = case_when(
+    name == "dx_within_twelve" ~ "Observed",
+    name == "pred_probs" ~ "Predicted"
+  )) %>%
+  group_by(race, name) %>%
+  summarise(mean_se(value, mult = 1.96),
+            .groups = "drop") %>%
+  ggplot(., aes(x = race, y = y, ymin = ymin, ymax = ymax,
+                fill = name, group = name)) +
+  geom_col(width = 0.5, position = "dodge") +
+  geom_errorbar(width = 0.2, position = position_dodge(0.5)) +
+  labs(x = "Race", y = "Probability of Migraine Dx",
+       fill = "") +
+  ggthemes::scale_fill_ptol() +
+  ggthemes::theme_tufte(base_size = 20, base_family = "sans")
+
+
+test_demographics %>%
+  group_by(race) %>%
+  summarise(
+    dx_within_twelve = mean(dx_within_twelve, na.rm = T),
+    n = n(),
+    .groups = "drop") %>%
+  mutate(dx_within_twelve = ifelse(
+    dx_within_twelve == 0,
+    0.005, dx_within_twelve
+  )) %>%
+  ggplot(., aes(x = race, y = dx_within_twelve)) +
+  geom_col(width = 0.5, position = "dodge") +
+  scale_y_continuous(limits = c(-0.02,0.3), 
+                     breaks = seq(0, 0.3, 0.05)) +
+  labs(x = "Race", y = "Predicted Probability") +
+  ggthemes::scale_fill_ptol() +
+  ggthemes::theme_tufte(base_size = 20, base_family = "sans") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
 

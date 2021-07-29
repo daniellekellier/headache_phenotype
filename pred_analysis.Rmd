@@ -1,3 +1,13 @@
+---
+title: "HPR 660 - Final Presentation Code"
+author: "Danielle Kellier"
+date: "7/28/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
 
 Load packages.
 ```{r}
@@ -255,7 +265,6 @@ rowsum_columns <- \(x){
 
 data_ed_first_visits <- data_ed_admission_ha_char %>%
   filter(ha_in_oneliner) %>% # Select HA related visits
-  filter(between(age, 3, 17)) %>% # Restrict to 3-17yos
   filter(contact_date < as.Date("2020-03-01")) %>% # Restrict to visit before March 2020 (in case of pandemic interference)
   group_by(record_id) %>%
   filter(row_number() == 1) %>% ungroup() %>% # Find first visit
@@ -306,7 +315,18 @@ data_ed_first_visits <- data_ed_admission_ha_char %>%
       )
       
       return(z)
-    })) %>%
+    }),
+    side = relevel(fct_collapse( # Collapse categories for side. Unilateral at baseline
+      side, 
+      `bilateral` = c("bi"),
+      `unilateral` = c("right", "left", "uni_l_r"),
+      `other` = c("oth")), ref = "unilateral"),
+    past_cond = ifelse(is.na(past_cond), # Flag if PMH included conditions relevant to secondary headache
+                       0, past_cond),
+    off_hours = as.numeric( # Label if visit occurred in off-hours (from 7PM - 7AM)
+      !between(contact_time, 
+               hm("07:00"), hm("19:00")))) %>%
+  filter(between(age, 3, 17)) %>% # Restrict to 3-17yos
   rowwise() %>% #Split data for rowwise calculations
   mutate( # Find symptoms across redundant columns
     nausea_vomit = rowsum_columns(
@@ -345,11 +365,6 @@ data_ed_first_visits <- data_ed_admission_ha_char %>%
       woke_from == 0 ~ 0,
       TRUE ~ NA_real_
     ),
-    past_cond = ifelse(is.na(past_cond), # Flag if PMH included conditions relevant to secondary headache
-                       0, past_cond),
-    off_hours = as.numeric( # Label if visit occurred in off-hours (from 7PM - 7AM)
-      !between(contact_time, 
-               hm("07:00"), hm("19:00"))),
     severity_oth = ifelse( # Find mentions of pain severity within note if pain rating is unclear
       severity %in% c(999, 9999) & 
         severity_oth == 'Pain severity: "',
@@ -357,11 +372,6 @@ data_ed_first_visits <- data_ed_admission_ha_char %>%
         str_subset(.x, regex("pain severity", ignore_case = T)),
         collapse = "; ")),
       severity_oth),
-    side = relevel(fct_collapse( # Collapse categories for side. Unilateral at baseline
-      side, 
-      `bilateral` = c("bi"),
-      `unilateral` = c("right", "left", "uni_l_r"),
-      `other` = c("oth")), ref = "unilateral"),
     severity_new = case_when( # Mark if HA rated 7+ out of 10 or described as "severe" or "excruciating" or "very bad"
       severity %in% 7:10 ~ 1,
            severity %in% 0:6 ~ 0,
@@ -405,6 +415,19 @@ data_ed_first_visits_complete %>%
 ggplot(data = ., aes(year, fill = factor(train))) +
   geom_bar(stat = "count") +
   labs(x = "Year", y = "Count") +
+  ggthemes::scale_fill_ptol() +
+  ggthemes::theme_tufte(
+    base_size = 20, base_family = "sans") +
+  theme(legend.position = "none")
+
+# Plot monthly variation
+data_ed_first_visits_complete %>%
+  mutate(month = month(contact_date, label = TRUE),
+         year = factor(year(contact_date))) %>%
+  ggplot(data = ., aes(month, group = year, color = year)) +
+  geom_line(stat = "count") +
+  labs(x = "Month", y = "Count", color = "Year") +
+  scale_y_continuous(limits = c(0,NA)) +
   ggthemes::scale_fill_ptol() +
   ggthemes::theme_tufte(
     base_size = 20, base_family = "sans") +
@@ -502,6 +525,22 @@ tibble(y =  factor(data_ed_first_visits_test_encode[,1]),
 Calculate AUC with 95% CI
 ```{r}
 
+# Training data
+pROC::auc(factor(data_ed_first_visits_train_encode[,1]), 
+          elnet_train_preds) # Calculate AUC
+
+pROC::ci.auc(factor(data_ed_first_visits_train_encode[,1]), 
+             elnet_train_preds, conf.level = 0.95,
+             boot.stratified = T,
+             method = "bootstrap") #Calculate AUC CI via bootstrap model
+
+gmish::brier(
+  elnet_train_preds,
+  data_ed_first_visits_train_encode[,1]
+          ) # Calculate Brier score
+
+# Testing data
+
 pROC::auc(factor(data_ed_first_visits_test_encode[,1]), 
           elnet_test_preds) # Calculate AUC
 
@@ -509,6 +548,11 @@ pROC::ci.auc(factor(data_ed_first_visits_test_encode[,1]),
              elnet_test_preds, conf.level = 0.95,
              boot.stratified = T,
              method = "bootstrap") #Calculate AUC CI via bootstrap model
+
+gmish::brier(
+  elnet_test_preds,
+  data_ed_first_visits_test_encode[,1]
+          ) # Calculate Brier score
 
 ```
 
